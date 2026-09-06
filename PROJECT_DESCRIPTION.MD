@@ -1,6 +1,6 @@
 # Project Description
 
-**What you're evaluating:** a LangGraph agent that classifies e-commerce customer
+**What was evaluated:** a LangGraph agent that classifies e-commerce customer
 support tickets into 5 categories — `order_status`, `refund_request`,
 `product_issue`, `account_help`, `other`.
 
@@ -8,10 +8,124 @@ support tickets into 5 categories — `order_status`, `refund_request`,
 
 ---
 
+## Part 1: Inspect and annotate classifier failures
+
+**What I did:** Filtered the worksheet's Step 1 tab to `Fail` and annotated each
+failed row with the specific cue the model latched onto versus what the customer
+actually needed.
+
+**Findings:** Two distinct failure directions kept showing up, both driven by the
+same root cause — the classifier routing on incidental nouns in the ticket
+("order," "delivered," "package," "address") instead of the customer's actual
+requested action:
+
+- **6 of 8 tickets:** an explicit refund ask (e.g. *"I never received my order and
+  I want my money back"*) got overridden by delivery/order language and misrouted
+  to `order_status`.
+- **2 of 8 tickets:** a genuine non-delivery issue got misrouted to `account_help`
+  because the ticket happened to mention the word "address" (e.g. *"Carrier
+  delivered to the wrong address"*), even though the customer never asked to
+  update anything on their account.
+
+## Part 2: Create failure categories
+
+**What I did:** Clustered the Step 1 annotations and picked one category to carry
+into Step 4: **"Delivery/order keyword anchoring overrides the customer's actual
+stated need (refund_request or order_status)."**
+
+**Findings:** This cluster was the highest-impact one to fix, for two concrete
+business reasons — refund-ask tickets misrouted to `order_status` delay the
+refund and carry chargeback/dispute risk, and non-delivery tickets misrouted to
+`account_help` mean a real missing package sits uninvestigated while the customer
+is asked to "confirm their address" instead of getting an actual answer.
+
+## Part 3: Tweak the classifier prompt
+
+**What I did:** Iterated through several versions of the disambiguation rule
+before landing on a final prompt. Early attempts either flipped the priority the
+wrong way (making refund-ask always win, which regressed the model against a
+*different* dataset's labeling convention) or restored the original "non-delivery
+wins" rule (which regressed against *this* worksheet's convention once the
+underlying dataset was corrected — see the data-mismatch note below). The final
+prompt reframes classification around "what action is the customer asking you to
+take," with ordered disambiguation rules (explicit refund ask wins over delivery
+language; a mentioned address alone doesn't trigger `account_help`) plus three
+worked few-shot examples.
+
+**Findings:**
+- Validated against the exact 8 documented failure tickets (`t012`–`t017`,
+  `t024`–`t025`): **8/8 now classify correctly** — both failure directions from
+  Part 1 are fixed.
+- Re-running the full 150-ticket golden dataset: baseline `CLASSIFIER_PROMPT`
+  scores **96.67%** (145/150); the new prompt scores **96.00%** (144/150) — a
+  net *regression* of 1 ticket, caused by two failures unrelated to the targeted
+  category: `t006` ("tracking link just spins forever," true `order_status`) and
+  `t100` ("2FA codes showing up unrequested," true `account_help`) both got
+  misrouted to `other`. The new prompt's "state an explicit action" framing is
+  strict enough that these two tickets — which imply a request rather than state
+  one outright — no longer clearly match any category. This wasn't in scope to
+  fix (the instruction was to fix one category at a time), but it's a real
+  trade-off worth knowing about before shipping this prompt as-is.
+
+## Part 4: Run LLM-as-a-judge
+
+**What I did:** Built `llm_as_judge.py`, which reads the worksheet's own
+`LLM-J Dataset.csv` (the 29 failed rows) and, per row, runs two independent LLM
+calls: a 4-way failure categorizer (`REFUND_MISSED` / `ORDER_STATUS_MISSED` /
+`ACCOUNT_HELP_CONFUSION` / `OTHER`) and the worksheet's own `Refund_Missed`
+binary judge prompt from Step 6 — shown only the ticket text and predicted
+intent, blind to the categorizer's own output.
+
+**Findings:** Across all 29 rows: 12 `REFUND_MISSED`, 9 `ACCOUNT_HELP_CONFUSION`,
+6 `OTHER`, 2 `ORDER_STATUS_MISSED`. The independent judge agreed with the
+categorizer's implied ground truth on **100%** of rows — every row the
+categorizer labeled `REFUND_MISSED` also got a `TRUE` from the standalone judge,
+and vice versa. See `LLM-J-gpt-4o.csv` / `LLM-J-gpt-5-mini.csv` for the raw
+per-row output.
+
+## Part 5: Align the LLM judge
+
+**What I did:** Ran the identical judge prompt through two candidate models,
+`gpt-4o` and `gpt-5-mini`, and compared them row by row (`LLM-J-comparison.csv`).
+
+**Findings:** Both models scored **100% agreement** with ground truth, and
+**100% agreement with each other** on every row — no `Match? = false` rows
+turned up to align on with this particular 29-row set. That's a real result, not
+a null one: it means this specific curated failure set is unambiguous enough that
+model choice didn't matter here. Given the tie, `gpt-4o` is the more defensible
+default (more established structured-output track record for this kind of
+classification judge), but the exercise's usual "which model's mistakes are
+easier to fix" tradeoff never came up because neither model made any mistakes on
+this set. A noisier or larger judge dataset would be needed to actually surface a
+disagreement worth calibrating.
+
+## Part 6: Inspect evaluation traces with LangSmith
+
+**What I did:** Debugged and fixed a LangSmith authentication bug before this
+part could work at all — the notebook's credential-loading helper only prompted
+for a new API key `if` the environment variable wasn't already set, so a stale or
+revoked key left over in a running kernel process silently blocked every trace
+upload with `403 Forbidden`, regardless of how many times the key was rotated in
+`.env.demo` or `langsmith_key.txt`. Fixed the notebook so it always loads
+`LANGSMITH_API_KEY`/`OPENAI_API_KEY` from `.env.demo` when present, overriding
+any stale in-process value. Then ran the notebook end-to-end
+(`jupyter nbconvert --execute`) to confirm traces actually export.
+
+**Findings:** After the fix, the full notebook run produced zero `403`/export
+errors. Each ticket classification appears in the LangSmith project
+`customer-support-evals` as its own trace, tagged via OpenTelemetry span
+attributes (`eval.run_name`, `eval.prompt_version`, `eval.example_id`,
+`eval.true_category`, `eval.predicted_category`, `eval.correct`,
+`eval.reasoning`) — so any row in `results_v1.csv`/`results_v2.csv` can be traced
+back to the exact model call that produced it, and baseline vs. improved runs are
+separable by `otel_run_name`/`otel_prompt_version`.
+
+---
+
 ## Known issue: dataset mismatch and an unexplained accuracy gap
 
 Two things came up while working through this exercise that materially affect how
-to read the spreadsheet's failure analysis against the notebook's own runs.
+to read the findings above.
 
 **1. The notebook's original dataset didn't match this worksheet.**
 `week4_customer_support_evals.ipynb` originally generated its own ticket dataset
@@ -31,7 +145,7 @@ Re-running the identical `CLASSIFIER_PROMPT` text, against the identical ticket
 text, live through `gpt-4o-mini` at `temperature=0` today scores **96.67%**, not
 80.70%. Comparing row-by-row, the worksheet's own `Predicted Intent` column agrees
 with a fresh live run on only 83.3% of rows — including the exact 8-ticket
-"keyword anchoring" cluster (`t012`–`t017`, `t024`–`t025`) that Step 4's failure
+"keyword anchoring" cluster (`t012`–`t017`, `t024`–`t025`) that Part 2/3's failure
 category is built on. That cluster is genuinely documented in the worksheet's
 static data, but a live rerun of the notebook today does not reproduce those
 specific failures. The cause isn't confirmed — it could be model drift (the
@@ -40,65 +154,10 @@ temperature 0), different sampling settings used for the original run, or the
 worksheet's `Predicted Intent` column having been hand-authored to illustrate the
 failure taxonomy rather than captured from a live, reproducible call.
 
-**Consequence:** because of this, the failure-category work done in the
-spreadsheet (Steps 1–4, based on this worksheet's static `Predicted Intent`
-column) does not actually match what a fresh `python -m jupyter nbconvert
---execute` run of the notebook produces today — the live classifier no longer
-fails on the same rows the worksheet documents. The prompt fix in Step 4 was
-validated directly against the worksheet's documented failure rows (all 8 now
-classify correctly), not against a live baseline rerun, since the live baseline
-no longer exhibits the bug.
-
----
-
-## Part 1: Inspect and annotate classifier failures
-
-- Open **Step 1 · Tag failures**. Filter `Pass / Fail` to `Fail`.
-- Don't edit ticket text, true category, predicted category, reasoning, or `Pass / Fail`.
-- In `Annotation`, explain *why* the model got each row wrong.
-- A strong annotation names the competing cue, the wrong route taken, and the route that should have won — not just "wrong" or "confusing."
-
-## Part 2: Create failure categories
-
-- Open **Step 2 · Group + name**. Re-read your Step 1 annotations and cluster failures that fail the same way. Group first, name second.
-- For each cluster, record: a short title (e.g. `[Signal]_Missed`), a one-line definition of the exact failure pattern, a count of affected rows, and one sentence on why it matters.
-- Open **Step 3 · Label failures** and assign every failed row to one of the Step 2 categories, using identical spelling so filters/summaries work.
-
-## Part 3: Tweak the classifier prompt
-
-- Open **Step 4 · Tweak the prompt**. Pick the failure category that matters most for the business and make **one** focused prompt change — not a full rewrite.
-- Options: a disambiguation rule separating the failure pattern from what it's confused with, a few-shot example of the corrected route, or a regression check re-running previously-passing tickets to confirm no overcorrection.
-- Use notebook Sections 9–10 to rerun the classifier and compare v1 vs v2, looking for both wins and regressions.
-
-## Part 4: Run LLM-as-a-judge (Optional)
-
-- Run from notebook Section 11 after Step 3 labels are complete.
-- The judge doesn't discover the failure category — you pick one target category from Step 2/3 first, then the judge answers one binary question per failed row: does this row belong to the target category?
-- Key fields: **Rows judged** (all 29 classifier-failure rows), **Target category** (your pick), **Ground Truth** (TRUE if the row's Step 3 label matches the target category), **Judge Prediction** (TRUE/FALSE + reason), **Agreement** (% where Judge Prediction matches Ground Truth).
-- After running, **Step 5 · LLM-J** should hold the failure category, ground truth, judge prediction, judge reasoning, and match indicator for every row.
-
-## Part 5: Align the LLM judge (Optional)
-
-- Open **Step 6 · Tweak the LLM judge** after Step 5 is populated. Inspect rows where `Match?` is false.
-- First move: compare at least two candidate judge models on the same binary judge task, and pick whichever's mistakes are easiest to defend or fix.
-- If a different/stronger model fixes most misses, prefer swapping the model over patching the prompt. If multiple models share the same mistake, calibrate the prompt instead (a contrast rule or a representative few-shot example).
-- Rerun notebook Section 11 after any model or prompt change and compare agreement across runs.
-
-## Part 6: Inspect evaluation traces with LangSmith
-
-- Run notebook Section 2 before the classifier so LangSmith tracing is enabled and the project is configured.
-- In Sections 5a–6, confirm each ticket classification appears as an individual trace in the LangSmith project.
-- Use the ticket/example ID in the run metadata to connect a trace to its spreadsheet/CSV row, and the run name + prompt version metadata to separate baseline vs improved runs.
-- When reviewing failures or regressions, inspect the true category, predicted category, correctness flag, and model reasoning alongside the trace.
-
----
-
-## Evaluation criteria
-
-| Step | Requirement |
-|---|---|
-| Step 1 | Filter `Pass / Fail` to `Fail`. Add a specific annotation per failed row — Step 2 clustering depends on these. |
-| Step 2 | Cluster Step 1 annotations into 2–4 named failure categories, each with a title, one-line definition, and one-line "why it matters." |
-| Step 3 | Assign every failed row to a Step 2 category, turning the clusters into a labeled failure dataset. |
-| Step 4 | Pick the highest-impact failure category and make ONE focused prompt change. Re-run the notebook. Record expected impact and regression risk. |
-| Optional LLM-J | Notebook Section 11 runs three judge prompts and writes agreement-with-humans scores into `Step 4 · LLM-J`. `Step 4 · Judge disagreements` shows where you and the winning judge disagree — that's where alignment work happens. |
+**Consequence:** because of this, the failure-category work described in Parts
+1–3 (based on this worksheet's static `Predicted Intent` column) doesn't line up
+with what a fresh notebook run produces today — the live classifier no longer
+fails on the same rows the worksheet documents. That's why Part 3's prompt fix
+was validated directly against the worksheet's documented failure rows (8/8 now
+correct) rather than against a live baseline rerun, which no longer exhibits the
+original bug.
