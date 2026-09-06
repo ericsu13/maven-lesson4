@@ -1,6 +1,8 @@
 .env
 .env.*
 *.env
+langsmith_key.txt
+*.bak
 .ipynb_checkpoints/
 __pycache__/
 .venv/
